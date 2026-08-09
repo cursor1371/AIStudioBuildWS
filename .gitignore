@@ -1,0 +1,43 @@
+# Virtual environment
+venv/
+.venv/
+env/
+.env/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables
+# Do not commit .env files containing sensitive credentials.
+# .env.example is a template and should be committed.
+.env
+
+
+# Runtime data
+# These directories are generated at runtime and may contain sensitive information.
+logs/
+cookies/
+docs/
+
+# IDE / Editor specific files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# AI files
+.claude/
+.serena/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
