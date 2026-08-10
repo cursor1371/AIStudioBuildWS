@@ -167,29 +167,156 @@ cmd_status() {
         warn "supervisord 未在运行"
         return
     fi
+
+    echo ""
+    echo -e "${CYAN}═══ 服务状态 ═══${NC}"
     echo ""
     sctl status
     echo ""
 
-    # 显示资源占用
+    # 获取主进程 PID
     local pid
     pid=$(sctl pid aistudio 2>/dev/null || echo "0")
-    if [ "$pid" != "0" ] && [ -n "$pid" ]; then
-        info "进程 PID: ${pid}"
-        # 获取进程树的总内存
-        if command -v pmap &>/dev/null; then
-            local rss
-            rss=$(ps --no-headers -o rss -p "$pid" 2>/dev/null || echo "0")
-            if [ "$rss" != "0" ]; then
-                local rss_mb=$((rss / 1024))
-                info "主进程 RSS: ${rss_mb} MB"
-            fi
-        fi
-        # 统计子进程数
-        local children
-        children=$(pgrep -P "$pid" 2>/dev/null | wc -l || echo "0")
-        info "子进程数: ${children}"
+    if [ "$pid" = "0" ] || [ -z "$pid" ]; then
+        warn "应用进程未运行"
+        return
     fi
+
+    echo -e "${CYAN}═══ 进程信息 ═══${NC}"
+    echo ""
+    info "主进程 PID: ${pid}"
+
+    # 主进程内存
+    local main_rss
+    main_rss=$(ps --no-headers -o rss -p "$pid" 2>/dev/null || echo "0")
+    local main_rss_mb=$((main_rss / 1024))
+
+    # 收集所有后代进程（递归查找整棵进程树）
+    local all_pids
+    all_pids=$(pstree -p "$pid" 2>/dev/null | grep -oP '\(\K[0-9]+(?=\))' | sort -u 2>/dev/null || echo "$pid")
+    local child_count=0
+    local total_rss=0
+    local firefox_rss=0
+    local firefox_count=0
+
+    while IFS= read -r cpid; do
+        [ -z "$cpid" ] && continue
+        local crss cname
+        crss=$(ps --no-headers -o rss -p "$cpid" 2>/dev/null || echo "0")
+        cname=$(ps --no-headers -o comm -p "$cpid" 2>/dev/null || echo "")
+        total_rss=$((total_rss + crss))
+
+        if [ "$cpid" != "$pid" ]; then
+            child_count=$((child_count + 1))
+        fi
+
+        # 识别 Firefox/Camoufox 进程
+        case "$cname" in
+            *firefox*|*camoufox*|*Web*Content*|*GPU*Process*|*Socket*Process*|*RDD*Process*)
+                firefox_rss=$((firefox_rss + crss))
+                firefox_count=$((firefox_count + 1))
+                ;;
+        esac
+    done <<< "$all_pids"
+
+    local total_rss_mb=$((total_rss / 1024))
+    local firefox_rss_mb=$((firefox_rss / 1024))
+    local python_rss_mb=$((total_rss_mb - firefox_rss_mb))
+
+    # 进程启动时间
+    local start_time
+    start_time=$(ps --no-headers -o lstart -p "$pid" 2>/dev/null || echo "")
+    if [ -n "$start_time" ]; then
+        info "启动时间: ${start_time}"
+    fi
+
+    # CPU 使用率
+    local cpu_usage
+    cpu_usage=$(ps --no-headers -o %cpu -p "$pid" 2>/dev/null | tr -d ' ' || echo "")
+    if [ -n "$cpu_usage" ]; then
+        info "主进程 CPU: ${cpu_usage}%"
+    fi
+
+    echo ""
+    echo -e "${CYAN}═══ 内存占用 ═══${NC}"
+    echo ""
+    printf "  %-28s %s\n" "Python 主进程:" "${main_rss_mb} MB"
+    if [ $firefox_count -gt 0 ]; then
+        printf "  %-28s %s\n" "浏览器进程 (${firefox_count} 个):" "${firefox_rss_mb} MB"
+    fi
+    printf "  %-28s %s\n" "其他子进程:" "$((python_rss_mb - main_rss_mb)) MB"
+    echo "  ────────────────────────────────"
+    printf "  %-28s %s\n" "总计 (${child_count} 个子进程):" "${total_rss_mb} MB"
+
+    # 尝试从健康检查端点获取应用状态
+    echo ""
+    echo -e "${CYAN}═══ 应用状态 ═══${NC}"
+    echo ""
+
+    local health_url="http://127.0.0.1:7860/health"
+    local health_json
+    health_json=$(curl -s --connect-timeout 3 --max-time 5 "$health_url" 2>/dev/null || echo "")
+
+    if [ -n "$health_json" ] && echo "$health_json" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+        # 解析 JSON（使用 Python，不引入 jq 依赖）
+        echo "$health_json" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+
+# 服务状态
+status = d.get('status', '?')
+status_colors = {
+    'healthy': '\033[0;32m',     # 绿色
+    'partial': '\033[1;33m',     # 黄色
+    'starting': '\033[0;36m',    # 青色
+    'degraded': '\033[0;31m',    # 红色
+    'stopping': '\033[0;31m',
+    'waiting_cookie_update': '\033[1;33m',
+}
+color = status_colors.get(status, '\033[0m')
+print(f'  服务状态:         {color}{status}\033[0m')
+
+# 实例统计
+configured = d.get('configured_instances', 0)
+ready = d.get('ready_instances', 0)
+connected = d.get('connected_instances', 0)
+waiting = d.get('waiting_cookie_update_instances', 0)
+terminal = d.get('terminal_instances', 0)
+gen = d.get('browser_generation', 0)
+
+print(f'  浏览器代际:       #{gen}')
+print(f'  已注册账号:       {configured}')
+print(f'  运行中:           {ready}')
+print(f'  WS 已连接:        {connected}')
+if waiting > 0:
+    print(f'  等待Cookie更新:   \033[1;33m{waiting}\033[0m')
+if terminal > 0:
+    print(f'  已终止:           \033[0;31m{terminal}\033[0m')
+
+# Provider Label
+pl = d.get('provider_label', {})
+if pl.get('enabled'):
+    labeled = pl.get('labeled_instances', 0)
+    failures = pl.get('injection_failures', 0)
+    fail_str = f' (\033[1;33m{failures} 次注入失败\033[0m)' if failures > 0 else ''
+    print(f'  Provider Label:   {labeled} 个已标记{fail_str}')
+
+# 远程 Cookie
+rc = d.get('remote_cookie', {})
+if rc.get('configured'):
+    print(f'  远程Cookie:       已配置')
+
+# 告警
+alert = d.get('alerting', {})
+if alert.get('enabled'):
+    depth = alert.get('queue_depth', 0)
+    print(f'  邮件告警:         已启用 (队列: {depth})')
+"
+    else
+        warn "健康检查端点不可用 (${health_url})"
+        info "可能未启用 HG 模式或服务尚在启动中"
+    fi
+    echo ""
 }
 
 cmd_logs() {

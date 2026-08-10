@@ -13,7 +13,7 @@ greenlet==3.2.3
 idna==3.10
 language-tags==1.2.0
 lxml==5.4.0
-multidict==6.5.0
+multidict==6.5.1
 numpy==2.3.0
 orjson==3.10.18
 platformdirs==4.3.8
