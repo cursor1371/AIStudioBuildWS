@@ -235,7 +235,7 @@ _WS_RECONNECT_THRESHOLD = 2      # 连续 N 次非 CONNECTED 触发重连
 _COOKIE_VALIDATE_CLICKS = 120    # 120 * 30s = 1 小时
 _MAX_CONSECUTIVE_ERRORS = 3      # 页面错误连续恢复失败上限
 _MODAL_CHECK_INTERVAL = 5        # 遮罩层检查间隔（秒）
-
+_MAX_WS_RECONNECT_FAILURES = 3   # 连续 WS 重连失败次数上限，超过后触发 Context 重建
 
 # =====================================================================
 # 安全诊断工具（不抛异常）
@@ -341,9 +341,31 @@ async def _wait_for_ws_connected(page, logger=None, timeout=30) -> bool:
 
 
 async def reconnect_ws(page, logger=None) -> str:
-    """执行 Disconnect → Connect 重连流程"""
+    """
+    执行 Disconnect → Connect 重连流程。
+
+    包含页面存活前置检查：如果 Preview iframe 已不存在或页面对象已关闭，
+    跳过完整重连流程（避免浪费 ~20 秒和大量无效日志），直接返回 UNKNOWN。
+    """
     if logger:
         logger.info("开始执行WS重连流程: Disconnect -> Connect")
+
+    # ── 前置检查：页面/iframe 是否仍可用 ──
+    # 如果 iframe 不存在或 page 对象已关闭，后续所有按钮操作和等待都会失败，
+    # 提前返回可节省 ~20 秒并避免产生 6~8 条无效日志
+    try:
+        iframe = page.locator('iframe[title="Preview"]')
+        if await iframe.count() == 0:
+            if logger:
+                logger.warning("Preview iframe 不存在，跳过 WS 重连")
+            return "UNKNOWN"
+    except Exception as e:
+        if logger:
+            logger.warning(
+                f"WS 重连前置检查失败（页面可能已关闭）: {type(e).__name__}"
+            )
+        return "UNKNOWN"
+
     await dismiss_interaction_modal(page, logger)
     await _click_ws_button(page, "Disconnect", logger)
     await asyncio.sleep(2)
@@ -1833,6 +1855,7 @@ class BrowserSupervisor:
         click_counter = 0
         consecutive_error_count = 0
         ws_not_connected_count = 0
+        ws_reconnect_failures = 0
 
         while True:
             # ── 检查关闭信号 ──
@@ -1873,6 +1896,7 @@ class BrowserSupervisor:
                     last_ws_status = await get_ws_status(page, log)
                     record.last_ws_status = last_ws_status
                     ws_not_connected_count = 0
+                    ws_reconnect_failures = 0
                     log.info(f"页面重新加载后WS状态: {last_ws_status}")
 
                 # 3. iframe 保活点击
@@ -1888,17 +1912,29 @@ class BrowserSupervisor:
 
                     if current_ws == "CONNECTED":
                         ws_not_connected_count = 0
+                        ws_reconnect_failures = 0
                     else:
                         ws_not_connected_count += 1
                         if ws_not_connected_count >= _WS_RECONNECT_THRESHOLD:
+                            # 检查重连失败次数是否超过上限
+                            if ws_reconnect_failures >= _MAX_WS_RECONNECT_FAILURES:
+                                raise RecoverableInstanceError(
+                                    f"WS 重连连续失败 {ws_reconnect_failures} 次，"
+                                    f"页面可能已损坏，触发 Context 重建"
+                                )
+
+                            ws_reconnect_failures += 1
                             log.info(
-                                f"WS连续 {ws_not_connected_count} 次非CONNECTED，尝试重连..."
+                                f"WS连续 {ws_not_connected_count} 次非CONNECTED，"
+                                f"尝试重连 "
+                                f"({ws_reconnect_failures}/{_MAX_WS_RECONNECT_FAILURES})..."
                             )
                             await reconnect_ws(page, log)
                             current_ws = await get_ws_status(page, log)
-                            log.info(f"重连后WS状态: {current_ws}")
                             if current_ws == "CONNECTED":
                                 ws_not_connected_count = 0
+                                ws_reconnect_failures = 0
+                                log.info("WS 重连成功")
 
                     last_ws_status = current_ws
                     record.last_ws_status = current_ws
@@ -1912,6 +1948,7 @@ class BrowserSupervisor:
                             last_ws_status = await get_ws_status(page, log)
                             record.last_ws_status = last_ws_status
                             ws_not_connected_count = 0
+                            ws_reconnect_failures = 0
                         else:
                             consecutive_error_count += 1
                             if consecutive_error_count >= _MAX_CONSECUTIVE_ERRORS:
