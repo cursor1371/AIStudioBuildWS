@@ -151,8 +151,8 @@ info "Python 路径: $(which python)"
 
 # 安装 Python 依赖
 info "安装 Python 依赖包..."
-pip install --quiet --upgrade pip
-pip install --quiet -r "${PROJECT_DIR}/requirements.txt"
+pip install --upgrade pip
+pip install -r "${PROJECT_DIR}/requirements.txt"
 # 检测 supervisor：优先使用系统已有的，避免重复安装
 info "检测 supervisor..."
 SUPERVISORD_BIN=""
@@ -171,7 +171,7 @@ elif [ -x "${VENV_DIR}/bin/supervisord" ] && [ -x "${VENV_DIR}/bin/supervisorctl
 else
     # 均不存在，在 venv 内安装（不影响系统环境）
     info "未检测到 supervisor，安装到项目虚拟环境中..."
-    pip install --quiet supervisor
+    pip install supervisor
     SUPERVISORD_BIN="${VENV_DIR}/bin/supervisord"
     SUPERVISORCTL_BIN="${VENV_DIR}/bin/supervisorctl"
     info "supervisor 已安装到 venv: ${SUPERVISORD_BIN}"
