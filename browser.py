@@ -816,11 +816,30 @@ class BrowserSupervisor:
             "i_know_what_im_doing": True,
         }
         if self.config.proxy:
-            self.logger.info(f"使用代理: {mask_proxy_for_logging(self.config.proxy)}")
-            opts["proxy"] = {
-                "server": self.config.proxy,
-                "bypass": "localhost, 127.0.0.1",
-            }
+            from utils import parse_proxy_url
+            proxy_info = parse_proxy_url(self.config.proxy, self.logger)
+            if proxy_info:
+                # Playwright 要求凭据使用独立字段，不支持内联 user:pass@ 格式
+                proxy_server = f"{proxy_info.type}://{proxy_info.host}:{proxy_info.port}"
+                proxy_dict = {
+                    "server": proxy_server,
+                    "bypass": "localhost, 127.0.0.1",
+                }
+                if proxy_info.username:
+                    proxy_dict["username"] = proxy_info.username
+                if proxy_info.password:
+                    proxy_dict["password"] = proxy_info.password
+                opts["proxy"] = proxy_dict
+                self.logger.info(
+                    f"使用代理: {mask_proxy_for_logging(self.config.proxy)} "
+                    f"(类型: {proxy_info.type.upper()}, "
+                    f"认证: {'是' if proxy_info.username else '否'})"
+                )
+            else:
+                self.logger.warning(
+                    f"代理 URL 解析失败，将不使用代理: "
+                    f"{mask_proxy_for_logging(self.config.proxy)}"
+                )
 
         opts["firefox_user_prefs"] = {
             # ── 1. 禁用 GPU 合成 / WebRender ──
