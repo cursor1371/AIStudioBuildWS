@@ -236,6 +236,7 @@ _COOKIE_VALIDATE_CLICKS = 120    # 120 * 30s = 1 小时
 _MAX_CONSECUTIVE_ERRORS = 3      # 页面错误连续恢复失败上限
 _MODAL_CHECK_INTERVAL = 5        # 遮罩层检查间隔（秒）
 _WS_UNKNOWN_REBUILD_THRESHOLD = 10  # UNKNOWN 连续 N 次检测后触发 Context 重建（~15 分钟）
+_WS_SUMMARY_INTERVAL = 300       # WS 状态汇总日志间隔（秒）
 
 # =====================================================================
 # 安全诊断工具（不抛异常）
@@ -1461,12 +1462,14 @@ class BrowserSupervisor:
         等待所有实例任务完成，或浏览器故障/关闭信号。
 
         每轮重新扫描 self._tasks，确保 apply_cookie_changes 动态新增的
-        Task 也能被正确等待。每 600 秒输出一次全局状态汇总。
+        Task 也能被正确等待。每 600 秒输出一次全局状态汇总，
+        每 300 秒输出一次 WS 连接状态汇总。
 
         Returns:
             "shutdown" / "browser_fault" / "all_done"
         """
         last_summary = _time.time()
+        last_ws_summary = _time.time()
 
         while True:
             pending = {tid: t for tid, t in self._tasks.items() if not t.done()}
@@ -1493,6 +1496,11 @@ class BrowserSupervisor:
                     f"Browser: 代际#{self.generation}"
                 )
                 last_summary = now
+
+            # WS 状态汇总（每 300 秒）
+            if now - last_ws_summary >= _WS_SUMMARY_INTERVAL:
+                self._log_ws_summary()
+                last_ws_summary = now
 
             done, _ = await asyncio.wait(
                 pending.values(), timeout=1.0,
@@ -2041,6 +2049,42 @@ class BrowserSupervisor:
                     log,
                 )
                 raise RecoverableInstanceError(f"保活循环异常: {e}")
+
+    # =================================================================
+    # WS 状态汇总日志
+    # =================================================================
+
+    def _log_ws_summary(self):
+        """
+        输出所有 RUNNING 实例的 WS 连接状态汇总。
+
+        格式示例：
+        WS 状态汇总: 运行中 3 实例 (2/3 连接) | CONNECTED: 2, RECONNECTING: 1 |
+        明细: user1.json[CONNECTED], user2.json[RECONNECTING], user3.json[CONNECTED]
+        """
+        running = [r for r in self.records if r.state == InstanceState.RUNNING]
+        if not running:
+            return
+
+        total = len(running)
+        connected = sum(1 for r in running if r.last_ws_status == "CONNECTED")
+
+        # 按状态分组计数
+        status_counts = {}
+        for r in running:
+            s = r.last_ws_status
+            status_counts[s] = status_counts.get(s, 0) + 1
+        status_parts = [f"{s}: {c}" for s, c in sorted(status_counts.items())]
+
+        # 明细列表
+        details = [f"{r.display_name}[{r.last_ws_status}]" for r in running]
+
+        self.logger.info(
+            f"WS 状态汇总: 运行中 {total} 实例 "
+            f"({connected}/{total} 连接) | "
+            f"{', '.join(status_parts)} | "
+            f"明细: {', '.join(details)}"
+        )
 
     # =================================================================
     # 健康检查快照
