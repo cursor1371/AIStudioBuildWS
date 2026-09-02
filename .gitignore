@@ -38,6 +38,7 @@ Thumbs.db
 # AI files
 .claude/
 .serena/
+.playwright-cli/
 CLAUDE.md
 AGENTS.md
 GEMINI.md

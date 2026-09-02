@@ -17,6 +17,7 @@ main.py — 入口、异步编排、信号处理、后台 Cookie 刷新与健康
 import asyncio
 import os
 import signal
+import sys
 
 from utils import (
     load_env_file, ensure_dir, logs_dir, cookies_dir,
@@ -107,17 +108,21 @@ def build_runtime_config(logger) -> RuntimeConfig:
         
     # Provider Label 详细日志
     if provider_label.enabled:
+        parts = []
+        if provider_label.node_cookie_names:
+            parts.append(
+                f"Node: {len(provider_label.node_cookie_names)} 个键名"
+            )
+        if provider_label.channel_cookies:
+            parts.append(
+                f"Channel: {len(provider_label.channel_cookies)} 个固定KV"
+            )
         logger.info(
             f"Provider Label Cookie 注入: "
-            f"{len(provider_label.cookie_names)} 个 Cookie 名称 × "
+            f"{', '.join(parts)}, "
             f"{len(provider_label.gateway_domains)} 个网关域名, "
-            f"前缀: {provider_label.prefix}"
+            f"共 {provider_label.cookies_per_context} 条/Context"
         )
-        if provider_label.prefix == "default":
-            logger.warning(
-                "Provider Label 注入已启用但未配置 WS_LABEL_PREFIX，"
-                "使用默认前缀 default；多容器部署时可能无法区分来源"
-            )
     elif provider_label.requested:
         logger.warning(
             f"Provider Label Cookie 注入已禁用: {provider_label.disabled_reason}"
@@ -429,18 +434,43 @@ async def main_async():
 
     # ── 信号处理器注册 ──
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, _on_signal, sig, shutdown_event, logger)
-        except (ValueError, OSError, NotImplementedError):
-            pass
-    for sig_name in ('SIGQUIT', 'SIGHUP'):
-        sig_num = getattr(signal, sig_name, None)
-        if sig_num:
+    if sys.platform == 'win32':
+        # Windows: ProactorEventLoop 不支持 add_signal_handler，
+        # 使用 signal.signal() 同步注册，通过 call_soon_threadsafe 安全设置事件
+        def _win_signal_handler(signum, frame):
+            sig_name = (
+                signal.Signals(signum).name
+                if hasattr(signal, 'Signals') else str(signum)
+            )
+            logger.info(f"接收到信号 {sig_name}，触发关闭...")
             try:
-                loop.add_signal_handler(sig_num, _on_signal, sig_num, shutdown_event, logger)
+                loop.call_soon_threadsafe(shutdown_event.set)
+            except RuntimeError:
+                # 事件循环已关闭（进程即将退出），直接设置事件
+                shutdown_event.set()
+        signal.signal(signal.SIGINT, _win_signal_handler)
+        try:
+            signal.signal(signal.SIGTERM, _win_signal_handler)
+        except (ValueError, OSError):
+            pass
+    else:
+        # Unix: 使用 asyncio 原生信号处理
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(
+                    sig, _on_signal, sig, shutdown_event, logger
+                )
             except (ValueError, OSError, NotImplementedError):
                 pass
+        for sig_name in ('SIGQUIT', 'SIGHUP'):
+            sig_num = getattr(signal, sig_name, None)
+            if sig_num:
+                try:
+                    loop.add_signal_handler(
+                        sig_num, _on_signal, sig_num, shutdown_event, logger
+                    )
+                except (ValueError, OSError, NotImplementedError):
+                    pass
 
     # ── 解析配置 ──
     config = build_runtime_config(logger)

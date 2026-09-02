@@ -231,11 +231,11 @@ _BROWSER_FAULT_KEYWORDS = (
 # 保活循环参数
 _KEEPALIVE_INTERVAL = 30          # 保活间隔（秒）
 _WS_CHECK_EVERY_N = 3            # 每 N 次循环检查 WS（~90 秒）
-_WS_RECONNECT_THRESHOLD = 2      # 连续 N 次非 CONNECTED 触发重连
+_WS_IDLE_ASSIST_THRESHOLD = 2    # IDLE/DISCONNECTED 连续 N 次检测后辅助一次重连
 _COOKIE_VALIDATE_CLICKS = 120    # 120 * 30s = 1 小时
 _MAX_CONSECUTIVE_ERRORS = 3      # 页面错误连续恢复失败上限
 _MODAL_CHECK_INTERVAL = 5        # 遮罩层检查间隔（秒）
-_MAX_WS_RECONNECT_FAILURES = 3   # 连续 WS 重连失败次数上限，超过后触发 Context 重建
+_WS_UNKNOWN_REBUILD_THRESHOLD = 10  # UNKNOWN 连续 N 次检测后触发 Context 重建（~15 分钟）
 
 # =====================================================================
 # 安全诊断工具（不抛异常）
@@ -292,12 +292,17 @@ async def get_ws_status(page, logger=None) -> str:
         frame = _get_preview_frame(page)
         if not frame:
             return "UNKNOWN"
-        element = frame.locator('text=/WS:\\s*(CONNECTED|IDLE|CONNECTING)/i').first
+        element = frame.locator(
+            'text=/WS:\\s*(CONNECTED|IDLE|CONNECTING|RECONNECTING|DISCONNECTED|ERROR)/i'
+        ).first
         if await element.is_visible(timeout=3000):
             text = await element.text_content()
             if text:
                 upper = text.upper()
-                for status in ("CONNECTED", "IDLE", "CONNECTING"):
+                for status in (
+                    "CONNECTED", "IDLE", "CONNECTING",
+                    "RECONNECTING", "DISCONNECTED", "ERROR",
+                ):
                     if status in upper:
                         return status
         return "UNKNOWN"
@@ -971,36 +976,35 @@ class BrowserSupervisor:
         """
         为账号注册 Provider Label 并检测冲突。
 
-        冲突处理：如果两个不同账号规范化后生成相同的 Label 值，
-        后注册的账号会被禁用 Provider Label 注入（仅影响标签，不影响核心功能）。
-
-        Args:
-            record: 待注册的实例记录
+        Node 层：从账号文件名派生 Cookie 值，冲突时仅跳过 Node 注入。
+        Channel 层：所有账号共享固定 KV，无需注册和冲突检测。
+        至少有一层可注入时启用 provider_label_enabled。
         """
         config = self._provider_label_config
         if not config or not config.enabled:
             return
 
-        label = build_provider_label_value(config.prefix, record.account_id)
-        if not label:
-            return
+        # ── Node 层注册（需冲突检测） ──
+        node_value = None
+        if config.node_cookie_names:
+            label = build_provider_label_value(record.account_id)
+            if label:
+                existing = self._provider_label_registry.get(label)
+                if existing is not None and existing != record.account_id:
+                    self.logger.warning(
+                        f"Provider Label Node 冲突：账号 {record.account_id} 与 "
+                        f"{existing} 均映射为相同标签；"
+                        f"已跳过 {record.account_id} 的 Node 层 Cookie 注入"
+                    )
+                else:
+                    self._provider_label_registry[label] = record.account_id
+                    node_value = label
 
-        # 冲突检测：同一 Label 不能映射到不同账号
-        existing = self._provider_label_registry.get(label)
-        if existing is not None and existing != record.account_id:
-            self.logger.warning(
-                f"Provider Label 冲突：账号 {record.account_id} 与 "
-                f"{existing} 均映射为相同标签；"
-                f"已跳过 {record.account_id} 的 Provider Label 注入，"
-                f"请调整账号文件名或前缀"
-            )
-            record.provider_label_enabled = False
-            record.provider_label_value = None
-            return
-
-        self._provider_label_registry[label] = record.account_id
-        record.provider_label_value = label
-        record.provider_label_enabled = True
+        # 至少有一层可注入才启用
+        record.provider_label_value = node_value
+        record.provider_label_enabled = (
+            node_value is not None or bool(config.channel_cookies)
+        )
 
     async def _inject_provider_label_cookies(self, context, record, log):
         """
@@ -1008,13 +1012,8 @@ class BrowserSupervisor:
 
         在 Google Cookie 注入之后、Page 创建之前调用。
         注入失败仅记录警告日志，不影响账号的正常运行。
-
-        Args:
-            context: Playwright BrowserContext 实例
-            record: 当前账号的 InstanceRecord
-            log: 该账号的 Logger 实例
         """
-        if not record.provider_label_enabled or not record.provider_label_value:
+        if not record.provider_label_enabled:
             return
 
         config = self._provider_label_config
@@ -1022,20 +1021,21 @@ class BrowserSupervisor:
             return
 
         cookies = build_provider_label_cookies(
-            record.provider_label_value,
-            config.cookie_names,
-            config.gateway_domains,
+            node_label_value=record.provider_label_value or "",
+            node_cookie_names=config.node_cookie_names,
+            channel_cookies=config.channel_cookies,
+            gateway_domains=config.gateway_domains,
         )
         if not cookies:
             return
 
         try:
             await context.add_cookies(cookies)
-            log.debug(f"已注入 {len(cookies)} 条 Provider Label Cookie")
+            log.debug(f"已注入 {len(cookies)} 条标识 Cookie")
         except Exception as e:
             self._provider_label_injection_failures += 1
             log.warning(
-                f"Provider Label Cookie 注入失败，已跳过该可选功能，"
+                f"标识 Cookie 注入失败，已跳过该可选功能，"
                 f"不影响账号启动: {type(e).__name__}"
             )
 
@@ -1873,8 +1873,9 @@ class BrowserSupervisor:
 
         click_counter = 0
         consecutive_error_count = 0
-        ws_not_connected_count = 0
-        ws_reconnect_failures = 0
+        ws_idle_count = 0
+        ws_unknown_count = 0
+        ws_assist_done = False
 
         while True:
             # ── 检查关闭信号 ──
@@ -1914,8 +1915,9 @@ class BrowserSupervisor:
                     await dismiss_popups_if_visible(page, log)
                     last_ws_status = await get_ws_status(page, log)
                     record.last_ws_status = last_ws_status
-                    ws_not_connected_count = 0
-                    ws_reconnect_failures = 0
+                    ws_idle_count = 0
+                    ws_unknown_count = 0
+                    ws_assist_done = False
                     log.info(f"页面重新加载后WS状态: {last_ws_status}")
 
                 # 3. iframe 保活点击
@@ -1927,33 +1929,55 @@ class BrowserSupervisor:
                     # 4a. WS 状态检查
                     current_ws = await get_ws_status(page, log)
                     if current_ws != last_ws_status:
-                        log.warning(f"WS状态变更: {last_ws_status} -> {current_ws}")
+                        log.info(f"WS状态变更: {last_ws_status} -> {current_ws}")
 
                     if current_ws == "CONNECTED":
-                        ws_not_connected_count = 0
-                        ws_reconnect_failures = 0
-                    else:
-                        ws_not_connected_count += 1
-                        if ws_not_connected_count >= _WS_RECONNECT_THRESHOLD:
-                            # 检查重连失败次数是否超过上限
-                            if ws_reconnect_failures >= _MAX_WS_RECONNECT_FAILURES:
-                                raise RecoverableInstanceError(
-                                    f"WS 重连连续失败 {ws_reconnect_failures} 次，"
-                                    f"页面可能已损坏，触发 Context 重建"
-                                )
+                        # 一切正常，重置所有计数
+                        ws_idle_count = 0
+                        ws_unknown_count = 0
+                        ws_assist_done = False
 
-                            ws_reconnect_failures += 1
+                    elif current_ws in ("CONNECTING", "RECONNECTING"):
+                        # 前端正在自动重连，Python 不介入
+                        ws_idle_count = 0
+                        ws_unknown_count = 0
+                        log.debug(f"前端正在自动重连 (状态: {current_ws})")
+
+                    elif current_ws in ("IDLE", "DISCONNECTED"):
+                        # 持续超阈值后辅助一次 Disconnect→Connect，之后不再主动干预
+                        ws_unknown_count = 0
+                        ws_idle_count += 1
+                        if ws_idle_count >= _WS_IDLE_ASSIST_THRESHOLD and not ws_assist_done:
                             log.info(
-                                f"WS连续 {ws_not_connected_count} 次非CONNECTED，"
-                                f"尝试重连 "
-                                f"({ws_reconnect_failures}/{_MAX_WS_RECONNECT_FAILURES})..."
+                                f"WS 持续 {current_ws} 状态 "
+                                f"{ws_idle_count} 次检测，"
+                                f"辅助执行一次 Disconnect→Connect"
                             )
                             await reconnect_ws(page, log)
-                            current_ws = await get_ws_status(page, log)
-                            if current_ws == "CONNECTED":
-                                ws_not_connected_count = 0
-                                ws_reconnect_failures = 0
-                                log.info("WS 重连成功")
+                            ws_assist_done = True
+                            ws_idle_count = 0
+
+                    elif current_ws == "ERROR":
+                        # 前端 WS 出错，scheduleReconnect 会自动接管
+                        ws_unknown_count = 0
+                        ws_idle_count = 0
+                        log.warning("前端 WS 状态为 ERROR，等待前端自动恢复")
+
+                    elif current_ws == "UNKNOWN":
+                        # iframe 不可达 — 唯一可能触发 Context 重建的 WS 状态
+                        ws_idle_count = 0
+                        ws_unknown_count += 1
+                        if ws_unknown_count >= _WS_UNKNOWN_REBUILD_THRESHOLD:
+                            raise RecoverableInstanceError(
+                                f"WS 持续 UNKNOWN 状态 {ws_unknown_count} 次检测 "
+                                f"(约 {ws_unknown_count * _WS_CHECK_EVERY_N * _KEEPALIVE_INTERVAL // 60} 分钟)，"
+                                f"iframe 可能已损坏，触发 Context 重建"
+                            )
+                        else:
+                            log.warning(
+                                f"WS 状态 UNKNOWN "
+                                f"({ws_unknown_count}/{_WS_UNKNOWN_REBUILD_THRESHOLD})"
+                            )
 
                     last_ws_status = current_ws
                     record.last_ws_status = current_ws
@@ -1966,8 +1990,9 @@ class BrowserSupervisor:
                             consecutive_error_count = 0
                             last_ws_status = await get_ws_status(page, log)
                             record.last_ws_status = last_ws_status
-                            ws_not_connected_count = 0
-                            ws_reconnect_failures = 0
+                            ws_idle_count = 0
+                            ws_unknown_count = 0
+                            ws_assist_done = False
                         else:
                             consecutive_error_count += 1
                             if consecutive_error_count >= _MAX_CONSECUTIVE_ERRORS:

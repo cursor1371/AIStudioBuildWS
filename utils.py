@@ -414,20 +414,23 @@ class ProviderLabelConfig:
     Provider Label Cookie 注入配置（不可变）。
 
     启动时解析一次，后续只读使用。
+    支持两层独立注入：
+    - Node 层：Cookie 键名可配，键值从账号文件名自动派生
+    - Channel 层：固定 Key=Value 对，所有账号共享
 
     Attributes:
         requested: 用户是否明确设置了 WS_LABEL_COOKIE_INJECTION=true
-        enabled: 是否实际启用（所有校验通过）
-        prefix: 规范化后的容器前缀
-        cookie_names: Cookie 名称元组
+        enabled: 是否实际启用（所有校验通过且至少一层有配置）
+        node_cookie_names: Node 层 Cookie 名称元组
+        channel_cookies: Channel 层固定 KV 对元组 ((name, value), ...)
         gateway_domains: 网关域名元组
         cookies_per_context: 每个 BrowserContext 注入的标签 Cookie 总数
         disabled_reason: 禁用原因（仅 requested=True 且 enabled=False 时有值）
     """
     requested: bool = False
     enabled: bool = False
-    prefix: str = "default"
-    cookie_names: tuple = ()
+    node_cookie_names: tuple = ()
+    channel_cookies: tuple = ()
     gateway_domains: tuple = ()
     cookies_per_context: int = 0
     disabled_reason: str = ""
@@ -462,57 +465,70 @@ def normalize_label_segment(raw: str) -> str:
     return s
 
 
-def build_provider_label_value(prefix: str, account_id: str) -> str:
+def build_provider_label_value(account_id: str) -> str:
     """
-    构建 Provider Label 完整标识值。
+    从账号文件名派生 Node Cookie 值。
 
-    格式：<规范化前缀>_<规范化账号文件名>
+    直接对 account_id 进行规范化，不再拼接前缀。
 
     Args:
-        prefix: 容器前缀（已规范化）
         account_id: 账号文件名（如 "account7.json"）
 
     Returns:
-        标识值（如 "ms01_account7_json"），长度不超过 256 字符；
-        账号名规范化为空时返回空字符串
+        规范化后的标识值（如 "account7_json"），
+        长度不超过 256 字符；规范化为空时返回空字符串
     """
-    norm_prefix = normalize_label_segment(prefix)
-    norm_account = normalize_label_segment(account_id)
-    if not norm_prefix:
-        norm_prefix = "default"
-    if not norm_account:
+    norm = normalize_label_segment(account_id)
+    if not norm:
         return ""
-    label = f"{norm_prefix}_{norm_account}"
-    if len(label) > _MAX_LABEL_VALUE_LEN:
-        label = label[:_MAX_LABEL_VALUE_LEN]
-    return label
+    if len(norm) > _MAX_LABEL_VALUE_LEN:
+        norm = norm[:_MAX_LABEL_VALUE_LEN]
+    return norm
 
 
-def build_provider_label_cookies(label_value: str, cookie_names: tuple,
-                                  gateway_domains: tuple) -> list:
+def build_provider_label_cookies(
+    node_label_value: str,
+    node_cookie_names: tuple,
+    channel_cookies: tuple,
+    gateway_domains: tuple,
+) -> list:
     """
-    为单个 BrowserContext 构建 Provider Label Cookie 列表。
+    为单个 BrowserContext 构建标识 Cookie 列表。
 
-    生成所有 Cookie 名称 × 所有网关域名的笛卡尔积。
-    每条 Cookie 使用 url 方式绑定到特定域名（Host-only Cookie），
-    不会泄露到其他子域名。
+    Node 层：node_cookie_names × gateway_domains，值统一为 node_label_value。
+    Channel 层：channel_cookies × gateway_domains，值各自独立。
 
     Args:
-        label_value: 标识值（如 "ms01_account7_json"）
-        cookie_names: Cookie 名称元组
+        node_label_value: Node 层 Cookie 值（如 "account7_json"）；
+                          为空时跳过 Node 层
+        node_cookie_names: Node 层 Cookie 名称元组
+        channel_cookies: Channel 层固定 KV 对元组 ((name, value), ...)
         gateway_domains: 网关域名元组
 
     Returns:
         Playwright context.add_cookies() 兼容的 Cookie 字典列表
     """
-    if not label_value:
+    if not gateway_domains:
         return []
     cookies = []
-    for name in cookie_names:
+    # ── Node 层 ──
+    if node_label_value:
+        for name in node_cookie_names:
+            for domain in gateway_domains:
+                cookies.append({
+                    "name": name,
+                    "value": node_label_value,
+                    "url": f"https://{domain}/",
+                    "sameSite": "None",
+                    "secure": True,
+                    "httpOnly": True,
+                })
+    # ── Channel 层 ──
+    for ch_name, ch_value in channel_cookies:
         for domain in gateway_domains:
             cookies.append({
-                "name": name,
-                "value": label_value,
+                "name": ch_name,
+                "value": ch_value,
                 "url": f"https://{domain}/",
                 "sameSite": "None",
                 "secure": True,
@@ -526,12 +542,12 @@ def parse_provider_label_config(logger=None) -> ProviderLabelConfig:
     从环境变量解析 Provider Label Cookie 注入配置。
 
     解析并校验以下环境变量：
-    - WS_LABEL_COOKIE_INJECTION: 是否启用
-    - WS_LABEL_COOKIE_NAME: Cookie 名称（逗号分隔）
+    - WS_LABEL_COOKIE_INJECTION: 总开关
     - WS_GATEWAY_DOMAINS: 网关域名（逗号分隔）
-    - WS_LABEL_PREFIX: 容器前缀
+    - WS_NODE_COOKIE_NAME: Node 层 Cookie 键名（逗号分隔，值从账号文件名派生）
+    - WS_CHANNEL_COOKIE: Channel 层固定 KV 对（逗号分隔的 key=value）
 
-    校验不通过时返回 disabled 状态的配置，不影响核心功能。
+    两层独立配置，至少配置一层才启用。
 
     Args:
         logger: 可选日志记录器
@@ -545,47 +561,14 @@ def parse_provider_label_config(logger=None) -> ProviderLabelConfig:
     if not requested:
         return ProviderLabelConfig()
 
-    # ── 解析前缀 ──
-    raw_prefix = clean_env_value(os.getenv("WS_LABEL_PREFIX")) or ""
-    prefix = normalize_label_segment(raw_prefix) if raw_prefix else "default"
-    if not prefix:
-        prefix = "default"
-    if len(prefix) > _MAX_LABEL_PREFIX_LEN:
-        prefix = prefix[:_MAX_LABEL_PREFIX_LEN]
-
-    # ── 解析 Cookie 名称 ──
-    raw_names = clean_env_value(os.getenv("WS_LABEL_COOKIE_NAME")) or "provider_label"
-    cookie_names = []
-    seen_names = set()
-    for name in raw_names.split(","):
-        name = name.strip()
-        if not name:
-            continue
-        if not _VALID_COOKIE_NAME_RE.match(name):
-            if logger:
-                logger.warning(
-                    f"Provider Label: Cookie 名称 '{name}' 包含非法字符，已跳过"
-                )
-            continue
-        if name in seen_names:
-            continue
-        seen_names.add(name)
-        cookie_names.append(name)
-
-    if len(cookie_names) > _MAX_LABEL_COOKIE_NAMES:
-        if logger:
-            logger.warning(
-                f"Provider Label: Cookie 名称数量 {len(cookie_names)} 超过上限 "
-                f"{_MAX_LABEL_COOKIE_NAMES}，仅使用前 {_MAX_LABEL_COOKIE_NAMES} 个"
-            )
-        cookie_names = cookie_names[:_MAX_LABEL_COOKIE_NAMES]
-
-    if not cookie_names:
-        return ProviderLabelConfig(
-            requested=True, disabled_reason="无有效 WS_LABEL_COOKIE_NAME"
+    # ── 迁移提示：检测已废弃的环境变量 ──
+    if os.getenv("WS_LABEL_PREFIX") and logger:
+        logger.warning(
+            "环境变量 WS_LABEL_PREFIX 已废弃且不再生效，"
+            "如需跨节点统一标识请使用 WS_CHANNEL_COOKIE 替代"
         )
 
-    # ── 解析网关域名 ──
+    # ── 解析网关域名（逻辑不变） ──
     raw_domains = clean_env_value(os.getenv("WS_GATEWAY_DOMAINS")) or ""
     gateway_domains = []
     seen_domains = set()
@@ -632,22 +615,124 @@ def parse_provider_label_config(logger=None) -> ProviderLabelConfig:
             requested=True, disabled_reason="无有效 WS_GATEWAY_DOMAINS"
         )
 
-    # ── 检查总数上限 ──
-    total = len(cookie_names) * len(gateway_domains)
+    # ── Node 层: WS_NODE_COOKIE_NAME（兼容旧版 WS_LABEL_COOKIE_NAME） ──
+    raw_node_names = clean_env_value(os.getenv("WS_NODE_COOKIE_NAME")) or ""
+    if not raw_node_names:
+        old_names = clean_env_value(os.getenv("WS_LABEL_COOKIE_NAME")) or ""
+        if old_names:
+            raw_node_names = old_names
+            if logger:
+                logger.warning(
+                    "环境变量 WS_LABEL_COOKIE_NAME 已更名为 WS_NODE_COOKIE_NAME，"
+                    "请更新配置；本次已自动兼容读取"
+                )
+    node_cookie_names = []
+    if raw_node_names:
+        seen_names = set()
+        for name in raw_node_names.split(","):
+            name = name.strip()
+            if not name:
+                continue
+            if not _VALID_COOKIE_NAME_RE.match(name):
+                if logger:
+                    logger.warning(
+                        f"Provider Label: Node Cookie 名称 '{name}' 包含非法字符，已跳过"
+                    )
+                continue
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            node_cookie_names.append(name)
+
+        if len(node_cookie_names) > _MAX_LABEL_COOKIE_NAMES:
+            if logger:
+                logger.warning(
+                    f"Provider Label: Node Cookie 名称数量 {len(node_cookie_names)} "
+                    f"超过上限 {_MAX_LABEL_COOKIE_NAMES}，"
+                    f"仅使用前 {_MAX_LABEL_COOKIE_NAMES} 个"
+                )
+            node_cookie_names = node_cookie_names[:_MAX_LABEL_COOKIE_NAMES]
+
+    # ── Channel 层: WS_CHANNEL_COOKIE ──
+    raw_channel = clean_env_value(os.getenv("WS_CHANNEL_COOKIE")) or ""
+    channel_cookies = []
+    if raw_channel:
+        seen_ch_names = set()
+        for pair in raw_channel.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                if logger:
+                    logger.warning(
+                        f"Provider Label: Channel Cookie 片段 '{pair}' 缺少等号，已跳过"
+                    )
+                continue
+            name, value = pair.split("=", 1)
+            name, value = name.strip(), value.strip()
+            if not name:
+                continue
+            if not _VALID_COOKIE_NAME_RE.match(name):
+                if logger:
+                    logger.warning(
+                        f"Provider Label: Channel Cookie 名称 '{name}' 包含非法字符，已跳过"
+                    )
+                continue
+            if not value:
+                if logger:
+                    logger.warning(
+                        f"Provider Label: Channel Cookie '{name}' 值为空，已跳过"
+                    )
+                continue
+            if len(value) > _MAX_LABEL_VALUE_LEN:
+                if logger:
+                    logger.warning(
+                        f"Provider Label: Channel Cookie '{name}' 值过长，已跳过"
+                    )
+                continue
+            if name in seen_ch_names:
+                if logger:
+                    logger.warning(
+                        f"Provider Label: Channel Cookie 名称 '{name}' 重复，"
+                        f"已跳过后续同名条目"
+                    )
+                continue
+            seen_ch_names.add(name)
+            channel_cookies.append((name, value))
+
+        if len(channel_cookies) > _MAX_LABEL_COOKIE_NAMES:
+            if logger:
+                logger.warning(
+                    f"Provider Label: Channel Cookie 数量 {len(channel_cookies)} "
+                    f"超过上限 {_MAX_LABEL_COOKIE_NAMES}，"
+                    f"仅使用前 {_MAX_LABEL_COOKIE_NAMES} 个"
+                )
+            channel_cookies = channel_cookies[:_MAX_LABEL_COOKIE_NAMES]
+
+    # ── 校验：至少有一层配置 ──
+    if not node_cookie_names and not channel_cookies:
+        return ProviderLabelConfig(
+            requested=True,
+            disabled_reason="WS_NODE_COOKIE_NAME 和 WS_CHANNEL_COOKIE 均未配置",
+        )
+
+    # ── 总数检查 ──
+    total = (len(node_cookie_names) + len(channel_cookies)) * len(gateway_domains)
     if total > _MAX_LABEL_COOKIES_PER_CTX:
         return ProviderLabelConfig(
             requested=True,
             disabled_reason=(
-                f"Cookie 名称({len(cookie_names)}) × 网关域名({len(gateway_domains)})"
-                f" = {total} 超过上限 {_MAX_LABEL_COOKIES_PER_CTX}"
+                f"Cookie 总数({len(node_cookie_names)} + {len(channel_cookies)}) × "
+                f"网关域名({len(gateway_domains)}) = {total} "
+                f"超过上限 {_MAX_LABEL_COOKIES_PER_CTX}"
             ),
         )
 
     return ProviderLabelConfig(
         requested=True,
         enabled=True,
-        prefix=prefix,
-        cookie_names=tuple(cookie_names),
+        node_cookie_names=tuple(node_cookie_names),
+        channel_cookies=tuple(channel_cookies),
         gateway_domains=tuple(gateway_domains),
         cookies_per_context=total,
     )
