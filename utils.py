@@ -14,6 +14,7 @@ utils.py — 通用工具函数
 - 目录创建等基础工具
 """
 
+import ipaddress
 import json
 import re
 import os
@@ -408,6 +409,26 @@ _VALID_COOKIE_NAME_RE = re.compile(r'^[A-Za-z0-9_\-]+$')
 _VALID_DOMAIN_RE = re.compile(r'^[a-zA-Z0-9.\-]+$')
 
 
+def _is_ip_address(host: str) -> bool:
+    """
+    判断主机名是否为 IP 地址。
+
+    支持 IPv4 和 IPv6。用于决定标识 Cookie 的 scheme 和 secure 属性：
+    IP 地址 → http + secure=false，域名 → https + secure=true。
+
+    Args:
+        host: 主机名字符串（不含端口）
+
+    Returns:
+        True 表示是 IP 地址
+    """
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 @dataclass(frozen=True)
 class ProviderLabelConfig:
     """
@@ -498,12 +519,20 @@ def build_provider_label_cookies(
     Node 层：node_cookie_names × gateway_domains，值统一为 node_label_value。
     Channel 层：channel_cookies × gateway_domains，值各自独立。
 
+    地址类型自动判定：
+    - IP 地址（含 host:port）→ http:// + secure=False（本地/内网网关）
+    - 域名 → https:// + secure=True（公网网关）
+
+    跨站 HTTP Cookie 发送依赖 Firefox pref
+    network.cookie.sameSite.noneRequiresSecure=false，
+    该 pref 在 browser.py _build_launch_options() 中设置。
+
     Args:
         node_label_value: Node 层 Cookie 值（如 "account7_json"）；
                           为空时跳过 Node 层
         node_cookie_names: Node 层 Cookie 名称元组
         channel_cookies: Channel 层固定 KV 对元组 ((name, value), ...)
-        gateway_domains: 网关域名元组
+        gateway_domains: 网关地址元组（域名或 host:port）
 
     Returns:
         Playwright context.add_cookies() 兼容的 Cookie 字典列表
@@ -511,27 +540,33 @@ def build_provider_label_cookies(
     if not gateway_domains:
         return []
     cookies = []
-    # ── Node 层 ──
-    if node_label_value:
-        for name in node_cookie_names:
-            for domain in gateway_domains:
+    for gw in gateway_domains:
+        # 根据地址类型决定 scheme 和 secure 属性
+        host = gw.rsplit(":", 1)[0] if ":" in gw else gw
+        is_ip = _is_ip_address(host)
+        scheme = "http" if is_ip else "https"
+        secure = not is_ip
+        url = f"{scheme}://{gw}/"
+
+        # ── Node 层 ──
+        if node_label_value:
+            for name in node_cookie_names:
                 cookies.append({
                     "name": name,
                     "value": node_label_value,
-                    "url": f"https://{domain}/",
+                    "url": url,
                     "sameSite": "None",
-                    "secure": True,
+                    "secure": secure,
                     "httpOnly": True,
                 })
-    # ── Channel 层 ──
-    for ch_name, ch_value in channel_cookies:
-        for domain in gateway_domains:
+        # ── Channel 层 ──
+        for ch_name, ch_value in channel_cookies:
             cookies.append({
                 "name": ch_name,
                 "value": ch_value,
-                "url": f"https://{domain}/",
+                "url": url,
                 "sameSite": "None",
-                "secure": True,
+                "secure": secure,
                 "httpOnly": True,
             })
     return cookies
@@ -568,7 +603,7 @@ def parse_provider_label_config(logger=None) -> ProviderLabelConfig:
             "如需跨节点统一标识请使用 WS_CHANNEL_COOKIE 替代"
         )
 
-    # ── 解析网关域名（逻辑不变） ──
+    # ── 解析网关域名 ──
     raw_domains = clean_env_value(os.getenv("WS_GATEWAY_DOMAINS")) or ""
     gateway_domains = []
     seen_domains = set()
@@ -576,20 +611,31 @@ def parse_provider_label_config(logger=None) -> ProviderLabelConfig:
         domain = domain.strip().lower()
         if not domain:
             continue
-        # 逐项校验：拒绝包含协议、路径、端口、认证信息等非法内容
         invalid_reason = None
         if "://" in domain:
-            invalid_reason = "包含协议（只需填写域名）"
+            invalid_reason = "包含协议（只需填写裸地址）"
         elif "/" in domain:
             invalid_reason = "包含路径"
-        elif ":" in domain:
-            invalid_reason = "包含端口"
         elif "?" in domain or "#" in domain:
             invalid_reason = "包含查询参数或片段"
         elif "@" in domain:
             invalid_reason = "包含认证信息"
-        elif not _VALID_DOMAIN_RE.match(domain):
-            invalid_reason = "格式不合法"
+        else:
+            # 分离 host[:port]，校验各部分合法性
+            host_part = domain
+            colon_count = domain.count(":")
+            if colon_count == 1:
+                # 一个冒号：host:port 格式
+                host_part, _, port_str = domain.rpartition(":")
+                if not port_str.isdigit() or not (1 <= int(port_str) <= 65535):
+                    invalid_reason = f"端口号 '{port_str}' 不合法"
+            elif colon_count > 1:
+                # 多个冒号：IPv6 地址，当前不支持
+                invalid_reason = "不支持 IPv6 地址（请使用 IPv4 或域名）"
+            # 校验 host 部分：允许 IPv4 地址或合法域名
+            if invalid_reason is None:
+                if not _is_ip_address(host_part) and not _VALID_DOMAIN_RE.match(host_part):
+                    invalid_reason = "主机名格式不合法"
 
         if invalid_reason:
             if logger:

@@ -887,6 +887,8 @@ class BrowserSupervisor:
             "toolkit.telemetry.enabled": False,
             # ── 9. 降低 UI 开销 ──
             "ui.prefersReducedMotion": 1,
+           # ── 10. 标识 Cookie 注入兼容（允许 HTTP 跨站发送 SameSite=None Cookie） ──
+            "network.cookie.sameSite.noneRequiresSecure": False,
         }
         return opts
 
