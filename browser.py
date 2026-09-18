@@ -132,8 +132,9 @@ class InstanceRecord:
     pending_cookies: Optional[List[Dict]] = None # 待应用的新 Cookie 数据
     pending_cookie_version: Optional[str] = None # 待应用的新 Cookie 版本号
     created_at: float = field(default_factory=_time.time)
+    last_heartbeat: float = 0.0                  # 最近一次保活循环成功完成的时间戳
     provider_label_value: Optional[str] = None   # 该账号的 Provider Label 值
-    provider_label_enabled: bool = False          # 是否启用 Provider Label 注入
+    provider_label_enabled: bool = False         # 是否启用 Provider Label 注入
 
 
 # =====================================================================
@@ -237,6 +238,11 @@ _MAX_CONSECUTIVE_ERRORS = 3      # 页面错误连续恢复失败上限
 _MODAL_CHECK_INTERVAL = 5        # 遮罩层检查间隔（秒）
 _WS_UNKNOWN_REBUILD_THRESHOLD = 10  # UNKNOWN 连续 N 次检测后触发 Context 重建（~15 分钟）
 _WS_SUMMARY_INTERVAL = 300       # WS 状态汇总日志间隔（秒）
+_KEEPALIVE_OP_TIMEOUT = 15        # 单个保活操作最大超时（秒）
+_KEEPALIVE_RECOVERY_TIMEOUT = 60  # 复杂操作（恢复/验证/重连）最大超时（秒）
+_MAX_CONSECUTIVE_STUCK = 3        # 连续迭代包含超时操作的上限，触发 Context 重建
+_HEARTBEAT_TIMEOUT = 300          # 心跳超时阈值（秒），超过此时长无心跳视为卡死
+_HEARTBEAT_CHECK_INTERVAL = 60   # Supervisor 心跳看门狗检查间隔（秒）
 
 # =====================================================================
 # 安全诊断工具（不抛异常）
@@ -857,6 +863,23 @@ class BrowserSupervisor:
             "fission.bfcacheInParent": False,
             "dom.ipc.processCount": 1,
             "dom.ipc.processCount.webIsolated": 1,
+            # ── 2b. 禁用辅助子进程 ──
+            # Preallocated：阻止预启动空白内容进程（单账号场景下无需预热）
+            "dom.ipc.processPrelaunch.enabled": False,
+            # RDD：将媒体解码移回父进程（本项目不涉及媒体播放）
+            "media.rdd-process.enabled": False,
+            # Socket：将网络 I/O 移回父进程
+            "network.process.enabled": False,
+            # Utility：禁用音视频工具进程
+            "media.utility-process.enabled": False,
+            # Privileged Content：不加载 about:newtab 等特权页面，无需独立进程
+            "dom.ipc.processCount.privilegedabout": 0,
+            "dom.ipc.processCount.privilegedmozilla": 0,
+            # WebExtension：扩展在父进程内运行（Camoufox 内置 uBlock 等）
+            "extensions.webextensions.remote": False,
+            # VR：完全禁用 VR 子系统
+            "dom.vr.process.enabled": False,
+            "dom.vr.enabled": False,
             # ── 3. 限制缓存 ──
             "browser.cache.disk.enable": False,
             "browser.cache.memory.capacity": 8192,
@@ -1472,6 +1495,7 @@ class BrowserSupervisor:
         """
         last_summary = _time.time()
         last_ws_summary = _time.time()
+        last_heartbeat_check = _time.time()
 
         while True:
             pending = {tid: t for tid, t in self._tasks.items() if not t.done()}
@@ -1503,6 +1527,16 @@ class BrowserSupervisor:
             if now - last_ws_summary >= _WS_SUMMARY_INTERVAL:
                 self._log_ws_summary()
                 last_ws_summary = now
+
+            # 心跳看门狗检查（每 60 秒）
+            if now - last_heartbeat_check >= _HEARTBEAT_CHECK_INTERVAL:
+                try:
+                    await self._check_stuck_instances()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.logger.error(f"心跳看门狗检查异常: {e}")
+                last_heartbeat_check = now
 
             done, _ = await asyncio.wait(
                 pending.values(), timeout=1.0,
@@ -1603,6 +1637,7 @@ class BrowserSupervisor:
 
                 # 验证通过，进入保活
                 record.state = InstanceState.RUNNING
+                record.last_heartbeat = _time.time()  # 初始化心跳时间戳
                 log.info("所有验证通过，确认已成功登录")
 
                 # 如果是从 Cookie 失效状态恢复成功，发送恢复通知
@@ -1886,6 +1921,7 @@ class BrowserSupervisor:
         ws_idle_count = 0
         ws_unknown_count = 0
         ws_assist_done = False
+        consecutive_stuck_count = 0  # 连续迭代超时计数
 
         while True:
             # ── 检查关闭信号 ──
@@ -1910,11 +1946,29 @@ class BrowserSupervisor:
                 raise _CookieUpdateSignal()
 
             try:
+                iteration_had_timeout = False
+
                 # 1. 遮罩层检测
-                await dismiss_interaction_modal(page, log)
+                try:
+                    await asyncio.wait_for(
+                        dismiss_interaction_modal(page, log),
+                        timeout=_KEEPALIVE_OP_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(f"遮罩层检测操作超时 ({_KEEPALIVE_OP_TIMEOUT}s)")
+                    iteration_had_timeout = True
 
                 # 2. 运行时弹窗扫描
-                clicked_buttons = await dismiss_popups_if_visible(page, log)
+                try:
+                    clicked_buttons = await asyncio.wait_for(
+                        dismiss_popups_if_visible(page, log),
+                        timeout=_KEEPALIVE_OP_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(f"弹窗扫描操作超时 ({_KEEPALIVE_OP_TIMEOUT}s)")
+                    clicked_buttons = []
+                    iteration_had_timeout = True
+
                 if any(btn in ("Reload", "Retry") for btn in clicked_buttons):
                     log.info("已通过弹窗扫描点击恢复按钮，等待页面重新加载...")
                     await asyncio.sleep(5)
@@ -1922,8 +1976,23 @@ class BrowserSupervisor:
                         await page.locator('mat-spinner').wait_for(state='hidden', timeout=15000)
                     except Exception:
                         pass
-                    await dismiss_popups_if_visible(page, log)
-                    last_ws_status = await get_ws_status(page, log)
+                    try:
+                        await asyncio.wait_for(
+                            dismiss_popups_if_visible(page, log),
+                            timeout=_KEEPALIVE_OP_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning(f"恢复后弹窗扫描超时 ({_KEEPALIVE_OP_TIMEOUT}s)")
+                        iteration_had_timeout = True
+                    try:
+                        last_ws_status = await asyncio.wait_for(
+                            get_ws_status(page, log),
+                            timeout=_KEEPALIVE_OP_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning(f"恢复后WS状态检查超时 ({_KEEPALIVE_OP_TIMEOUT}s)")
+                        last_ws_status = "UNKNOWN"
+                        iteration_had_timeout = True
                     record.last_ws_status = last_ws_status
                     ws_idle_count = 0
                     ws_unknown_count = 0
@@ -1931,13 +2000,29 @@ class BrowserSupervisor:
                     log.info(f"页面重新加载后WS状态: {last_ws_status}")
 
                 # 3. iframe 保活点击
-                await click_in_iframe(page, log)
+                try:
+                    await asyncio.wait_for(
+                        click_in_iframe(page, log),
+                        timeout=_KEEPALIVE_OP_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(f"iframe 保活点击操作超时 ({_KEEPALIVE_OP_TIMEOUT}s)")
+                    iteration_had_timeout = True
                 click_counter += 1
 
                 # 4. 定期 WS 与错误检查
                 if click_counter % _WS_CHECK_EVERY_N == 0:
                     # 4a. WS 状态检查
-                    current_ws = await get_ws_status(page, log)
+                    try:
+                        current_ws = await asyncio.wait_for(
+                            get_ws_status(page, log),
+                            timeout=_KEEPALIVE_OP_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning(f"WS 状态检查操作超时 ({_KEEPALIVE_OP_TIMEOUT}s)")
+                        current_ws = "UNKNOWN"
+                        iteration_had_timeout = True
+
                     if current_ws != last_ws_status:
                         log.info(f"WS状态变更: {last_ws_status} -> {current_ws}")
 
@@ -1963,7 +2048,16 @@ class BrowserSupervisor:
                                 f"{ws_idle_count} 次检测，"
                                 f"辅助执行一次 Disconnect→Connect"
                             )
-                            await reconnect_ws(page, log)
+                            try:
+                                await asyncio.wait_for(
+                                    reconnect_ws(page, log),
+                                    timeout=_KEEPALIVE_RECOVERY_TIMEOUT,
+                                )
+                            except asyncio.TimeoutError:
+                                log.warning(
+                                    f"WS 重连操作超时 ({_KEEPALIVE_RECOVERY_TIMEOUT}s)"
+                                )
+                                iteration_had_timeout = True
                             ws_assist_done = True
                             ws_idle_count = 0
 
@@ -1993,12 +2087,38 @@ class BrowserSupervisor:
                     record.last_ws_status = current_ws
 
                     # 4b. 页面错误检测与恢复
-                    error_info = await detect_page_errors(page, log)
+                    try:
+                        error_info = await asyncio.wait_for(
+                            detect_page_errors(page, log),
+                            timeout=_KEEPALIVE_OP_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning(f"页面错误检测操作超时 ({_KEEPALIVE_OP_TIMEOUT}s)")
+                        error_info = None
+                        iteration_had_timeout = True
+
                     if error_info:
-                        recovered = await attempt_error_recovery(page, log, error_info)
+                        try:
+                            recovered = await asyncio.wait_for(
+                                attempt_error_recovery(page, log, error_info),
+                                timeout=_KEEPALIVE_RECOVERY_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            log.warning(
+                                f"页面错误恢复操作超时 ({_KEEPALIVE_RECOVERY_TIMEOUT}s)"
+                            )
+                            recovered = False
+                            iteration_had_timeout = True
                         if recovered:
                             consecutive_error_count = 0
-                            last_ws_status = await get_ws_status(page, log)
+                            try:
+                                last_ws_status = await asyncio.wait_for(
+                                    get_ws_status(page, log),
+                                    timeout=_KEEPALIVE_OP_TIMEOUT,
+                                )
+                            except asyncio.TimeoutError:
+                                last_ws_status = "UNKNOWN"
+                                iteration_had_timeout = True
                             record.last_ws_status = last_ws_status
                             ws_idle_count = 0
                             ws_unknown_count = 0
@@ -2018,10 +2138,37 @@ class BrowserSupervisor:
 
                 # 5. Cookie 定期验证
                 if click_counter >= _COOKIE_VALIDATE_CLICKS:
-                    is_valid = await validate_cookies(page, log)
+                    try:
+                        is_valid = await asyncio.wait_for(
+                            validate_cookies(page, log),
+                            timeout=_KEEPALIVE_RECOVERY_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            f"Cookie 验证操作超时 ({_KEEPALIVE_RECOVERY_TIMEOUT}s)，暂时视为有效"
+                        )
+                        is_valid = True
+                        iteration_had_timeout = True
                     if not is_valid:
                         raise CookieInvalidError("Cookie 定期验证确认失效")
                     click_counter = 0
+
+                # ── 迭代超时追踪与心跳更新 ──
+                if iteration_had_timeout:
+                    consecutive_stuck_count += 1
+                    log.warning(
+                        f"本次保活迭代包含超时操作 "
+                        f"({consecutive_stuck_count}/{_MAX_CONSECUTIVE_STUCK})"
+                    )
+                    if consecutive_stuck_count >= _MAX_CONSECUTIVE_STUCK:
+                        raise RecoverableInstanceError(
+                            f"保活循环连续 {consecutive_stuck_count} 次迭代包含操作超时，"
+                            f"页面可能已无响应，触发 Context 重建"
+                        )
+                else:
+                    consecutive_stuck_count = 0
+
+                record.last_heartbeat = _time.time()
 
                 # 6. 可中断睡眠（含高频遮罩层检测和 Cookie 更新快速响应）
                 for tick in range(_KEEPALIVE_INTERVAL):
@@ -2034,7 +2181,15 @@ class BrowserSupervisor:
                     if record.cookie_update_pending:
                         break  # 跳出睡眠，下一轮主循环将处理热更新
                     if tick > 0 and tick % _MODAL_CHECK_INTERVAL == 0:
-                        await dismiss_interaction_modal(page, log)
+                        try:
+                            await asyncio.wait_for(
+                                dismiss_interaction_modal(page, log),
+                                timeout=_KEEPALIVE_OP_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            log.warning(
+                                f"睡眠期遮罩层检测超时 ({_KEEPALIVE_OP_TIMEOUT}s)"
+                            )
                     await asyncio.sleep(1)
 
             except (CookieInvalidError, RecoverableInstanceError,
@@ -2051,6 +2206,87 @@ class BrowserSupervisor:
                     log,
                 )
                 raise RecoverableInstanceError(f"保活循环异常: {e}")
+
+    async def _check_stuck_instances(self):
+        """
+        心跳看门狗：检测保活循环卡死的实例并强制重建。
+
+        仅检查状态为 RUNNING 且心跳已初始化（> 0）的实例。
+        当心跳超时超过 _HEARTBEAT_TIMEOUT 时，强制取消卡死的 Worker
+        并启动新 Worker 重建 Context。
+
+        此方法是（操作级超时保护）的第二层防护，
+        覆盖 asyncio.wait_for 自身未能生效的极端边界场景。
+        """
+        if not self._is_browser_available():
+            return
+
+        now = _time.time()
+        for record in self.records:
+            if (record.state != InstanceState.RUNNING
+                    or record.last_heartbeat <= 0):
+                continue
+
+            stale = now - record.last_heartbeat
+            if stale <= _HEARTBEAT_TIMEOUT:
+                continue
+
+            self.logger.warning(
+                f"实例 {record.display_name} 心跳超时 "
+                f"({stale:.0f}s > {_HEARTBEAT_TIMEOUT}s)，"
+                f"强制取消并重建 Context"
+            )
+
+            if self._notifier:
+                await self._notifier.emit(
+                    "INSTANCE_HEARTBEAT_TIMEOUT", "WARNING",
+                    account_id=record.account_id,
+                    message=(
+                        f"保活循环卡死 {stale:.0f}s，已强制重建 Context"
+                    ),
+                )
+
+            # ── 强制取消卡死的 Worker（带超时保护） ──
+            task = record.task
+            if task and not task.done():
+                task.cancel()
+                _, pending = await asyncio.wait({task}, timeout=10)
+                if pending:
+                    self.logger.warning(
+                        f"实例 {record.display_name} 任务取消超时，"
+                        f"将由浏览器代际重建时清理"
+                    )
+            self._tasks.pop(record.instance_id, None)
+            record.task = None
+
+            # ── 重试计数与状态更新 ──
+            record.retry_count += 1
+            record.last_heartbeat = 0.0
+
+            if record.retry_count > self.config.max_instance_retries:
+                record.state = InstanceState.RETRY_EXHAUSTED
+                self.logger.error(
+                    f"实例 {record.display_name} 重试次数已达上限 "
+                    f"({self.config.max_instance_retries})，实例终止"
+                )
+                continue
+
+            # ── 启动新 Worker ──
+            record.state = InstanceState.PENDING
+            record.browser_generation = self.generation
+            new_task = asyncio.create_task(
+                self._run_instance_worker(
+                    record, self._browser, self.generation
+                ),
+                name=f"instance-{record.display_name}",
+            )
+            self._tasks[record.instance_id] = new_task
+            record.task = new_task
+            self.logger.info(
+                f"实例 {record.display_name} 已强制重建 "
+                f"(重试 {record.retry_count}/"
+                f"{self.config.max_instance_retries})"
+            )
 
     # =================================================================
     # WS 状态汇总日志
