@@ -98,13 +98,6 @@ def build_runtime_config(logger) -> RuntimeConfig:
         f"邮件通知={'已启用' if config.notification_enabled else '未启用'}, "
         f"ProviderLabel={'已启用' if provider_label.enabled else '未启用'}"
     )
-
-    # 非浏览器出站代理日志
-    if config.proxy:
-        logger.info(
-            f"非浏览器出站代理: {proxy_display} "
-            f"(远程Cookie拉取 + SMTP邮件发送)"
-        )
         
     # Provider Label 详细日志
     if provider_label.enabled:
@@ -481,6 +474,26 @@ async def main_async():
             return
         logger.warning("目标URL未配置，健康检查服务将以 degraded 状态运行")
 
+    # ── 代理中继初始化 ──
+    _proxy_instance = None
+    if config.proxy:
+        try:
+            from proxy_relay import HttpProxy as _HttpProxy
+            _proxy_instance = _HttpProxy(
+                config.proxy,
+                connect_timeout=30.0,
+                idle_timeout=300.0,
+            )
+            local_url = await _proxy_instance.start()
+            config.local_proxy_url = local_url
+            logger.info(
+                f"代理中继已启动: "
+                f"{mask_proxy_for_logging(config.proxy)} → {local_url}"
+            )
+        except Exception as e:
+            logger.error(f"代理中继启动失败: {e}，将使用直连模式")
+            _proxy_instance = None
+
     # ── 创建告警管理器 ──
     notifier = AlertManager(config, get_logger("notifier"))
     await notifier.start()
@@ -506,6 +519,11 @@ async def main_async():
             logger.error("未找到任何有效 Cookie 来源且无远程 Cookie 配置")
             await notifier.stop()
             await cookie_mgr.close()
+            if _proxy_instance:
+                try:
+                    await _proxy_instance.stop()
+                except Exception:
+                    pass
             return
         if config.cookie_remote_url:
             logger.warning(
@@ -536,7 +554,16 @@ async def main_async():
             ),
             name="bg-recovery-check",
         ))
-
+    # ── 发送启动通知 ──
+    await notifier.emit(
+        "SERVICE_STARTED", "INFO",
+        message=(
+            f"服务已启动 "
+            f"(账号: {len(effective)}, "
+            f"模式: {'server' if config.hg_mode else 'standalone'}, "
+            f"代理: {'已启用' if config.local_proxy_url else '直连'})"
+        ),
+    )
     # ── 启动 ──
     if config.hg_mode:
         from aiohttp import web
@@ -592,6 +619,9 @@ async def main_async():
             if bg_tasks:
                 await asyncio.gather(*bg_tasks, return_exceptions=True)
 
+            # 发送退出通知（在 notifier.stop() 之前，利用 drain 机制发送）
+            await notifier.emit("SERVICE_STOPPING", "INFO", message="服务正在关闭")
+ 
             # 关闭告警服务（尝试发送剩余队列中的邮件）
             await notifier.stop()
 
@@ -602,6 +632,13 @@ async def main_async():
             logger.info("正在关闭 aiohttp 服务...")
             await runner.cleanup()
 
+            # 关闭代理中继（所有消费方已停止后最后关闭）
+            if _proxy_instance:
+                try:
+                    await _proxy_instance.stop()
+                    logger.info("代理中继已关闭")
+                except Exception:
+                    pass
     else:
         # 独立模式：运行监督器循环直到关闭信号
         try:
@@ -615,11 +652,22 @@ async def main_async():
             if bg_tasks:
                 await asyncio.gather(*bg_tasks, return_exceptions=True)
 
+            # 发送退出通知
+            await notifier.emit("SERVICE_STOPPING", "INFO", message="服务正在关闭")
+
             # 关闭告警服务
             await notifier.stop()
 
             # 关闭 Cookie 管理器的 HTTP 会话
             await cookie_mgr.close()
+
+            # 关闭代理中继（所有消费方已停止后最后关闭）
+            if _proxy_instance:
+                try:
+                    await _proxy_instance.stop()
+                    logger.info("代理中继已关闭")
+                except Exception:
+                    pass
 
     logger.info("主程序退出")
 
@@ -633,6 +681,14 @@ def main():
     ensure_dir(logs_dir())
     ensure_dir(cookies_dir())
     setup_root_logger(str(logs_dir() / 'app.log'))
+
+    # 将 proxy_relay 日志桥接到项目日志系统
+    import logging as _logging
+    _pr = _logging.getLogger('proxy_relay')
+    _pr.setLevel(_logging.INFO)
+    for _h in _logging.getLogger('camoufox').handlers:
+        _pr.addHandler(_h)
+    _pr.propagate = False
 
     try:
         asyncio.run(main_async())

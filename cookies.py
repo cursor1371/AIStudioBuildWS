@@ -37,7 +37,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from utils import clean_env_value, cookies_dir, ensure_dir, atomic_write_json, parse_proxy_url
+from utils import clean_env_value, cookies_dir, ensure_dir, atomic_write_json
 
 # =====================================================================
 # 常量
@@ -602,8 +602,8 @@ class CookieLifecycleManager:
         # aiohttp 会话（懒初始化，在首次远程请求时创建）
         self._session = None
 
-        # 代理配置（用于远程 Cookie 拉取，复用 CAMOUFOX_PROXY）
-        self._proxy_info = parse_proxy_url(config.proxy, logger) if config.proxy else None
+        # 本地代理中继 URL（用于远程 Cookie 拉取）
+        self._local_proxy_url = config.local_proxy_url
 
         # 环境变量扫描结果签名缓存（用于判断扫描结果是否变化，避免重复 INFO 日志）
         self._last_env_scan_key = None
@@ -1162,29 +1162,13 @@ class CookieLifecycleManager:
 
         使用懒初始化策略，仅在首次远程请求时创建会话。
         会话被 close() 关闭后，下次调用会重新创建。
-        代理策略：
-        - HTTP 代理：使用 aiohttp 原生 proxy 参数（per-request，在 _fetch_remote 中传递）
-        - SOCKS 代理：使用 aiohttp-socks ProxyConnector（per-session）
-        - aiohttp-socks 未安装时：降级为直连并输出警告
+
         Returns:
             aiohttp.ClientSession 实例
         """
         if self._session is None or self._session.closed:
             import aiohttp
-            connector = None
-            # SOCKS 代理需要通过 aiohttp-socks 的 ProxyConnector 处理
-            if self._proxy_info and self._proxy_info.type in ('socks5', 'socks4'):
-                try:
-                    from aiohttp_socks import ProxyConnector
-                    connector = ProxyConnector.from_url(self._proxy_info.raw_url)
-                    self.logger.debug(
-                        f"远程 Cookie 拉取使用 {self._proxy_info.type.upper()} 代理"
-                    )
-                except ImportError:
-                    self.logger.warning(
-                        "SOCKS 代理需要 aiohttp-socks 库，未安装，远程 Cookie 拉取回退为直连"
-                    )
-            self._session = aiohttp.ClientSession(connector=connector)
+            self._session = aiohttp.ClientSession()
         return self._session
 
     async def _fetch_remote(self, is_initial=False) -> Optional[Dict[str, list]]:
@@ -1230,15 +1214,10 @@ class CookieLifecycleManager:
 
         try:
             timeout = aiohttp.ClientTimeout(total=self.config.cookie_remote_timeout)
-            # HTTP 代理通过 aiohttp 原生 proxy 参数传递；SOCKS 代理已在 Session Connector 层处理
-            http_proxy = (
-                self._proxy_info.raw_url
-                if self._proxy_info and self._proxy_info.type == 'http'
-                else None
-            )
+
             async with self._get_session().get(
                 url, headers=headers, timeout=timeout,
-                allow_redirects=False, proxy=http_proxy
+                allow_redirects=False, proxy=self._local_proxy_url
             ) as resp:
 
                 # ── HTTP 304: 内容未变化 ──

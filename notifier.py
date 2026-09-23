@@ -19,7 +19,6 @@ from email.message import EmailMessage
 from typing import Optional
 
 from logger import get_logger
-from utils import parse_proxy_url
 
 # =====================================================================
 # 告警事件数据模型
@@ -51,48 +50,57 @@ class AlertEvent:
 # 代理 SMTP 客户端
 # =====================================================================
 
-class _ProxiedSMTP(smtplib.SMTP):
+class _HttpConnectSMTP(smtplib.SMTP):
     """
-    通过 PySocks 代理连接的 SMTP 客户端。
+    通过本地 HTTP 代理的 CONNECT 隧道连接 SMTP 服务器。
 
-    覆写 _get_socket() 方法，使用 PySocks 的 socksocket 建立代理连接。
-    支持 SOCKS5 / SOCKS4 / HTTP CONNECT 三种代理类型。
+    工作原理：
+    1. 与本地 HTTP 代理建立 TCP 连接
+    2. 发送 HTTP CONNECT 请求，代理建立到 SMTP 服务器的隧道
+    3. 代理返回 200 后，TCP 连接变为透明的端到端隧道
+    4. 在该隧道上正常进行 SMTP 会话（EHLO → STARTTLS → AUTH → 发送）
 
     继承 smtplib.SMTP 的全部功能，包括 STARTTLS、认证和上下文管理器。
     """
 
-    def __init__(self, host, port, proxy_info, timeout=30):
+    def __init__(self, host, port, proxy_host, proxy_port, timeout=30):
         """
         Args:
             host: SMTP 服务器地址
             port: SMTP 服务器端口
-            proxy_info: ProxyInfo 实例
+            proxy_host: 本地 HTTP 代理主机
+            proxy_port: 本地 HTTP 代理端口
             timeout: 连接超时（秒）
         """
-        self._pinfo = proxy_info
+        self._proxy_host = proxy_host
+        self._proxy_port = proxy_port
         super().__init__(host, port, timeout=timeout)
 
     def _get_socket(self, host, port, timeout):
-        """覆写：通过代理 socket 建立连接"""
-        import socks as pysocks
-
-        proxy_type_map = {
-            'socks5': pysocks.SOCKS5,
-            'socks4': pysocks.SOCKS4,
-            'http': pysocks.HTTP,
-        }
-        ptype = proxy_type_map.get(self._pinfo.type, pysocks.HTTP)
-
-        sock = pysocks.socksocket()
-        sock.set_proxy(
-            ptype,
-            self._pinfo.host,
-            self._pinfo.port,
-            username=self._pinfo.username,
-            password=self._pinfo.password,
+        """覆写：通过 HTTP CONNECT 隧道建立连接"""
+        import socket
+        sock = socket.create_connection(
+            (self._proxy_host, self._proxy_port), timeout=timeout
         )
+        connect_req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
+        sock.sendall(connect_req.encode("ascii"))
+        # 逐字节读取 CONNECT 响应，避免过度消费后续的 SMTP Banner 数据
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            byte = sock.recv(1)
+            if not byte:
+                sock.close()
+                raise ConnectionError("HTTP CONNECT: proxy closed connection")
+            buf += byte
+            if len(buf) > 8192:
+                sock.close()
+                raise ConnectionError("HTTP CONNECT: response too large")
+        status_line = buf.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+        parts = status_line.split(None, 2)
+        if len(parts) < 2 or not parts[1].startswith("2"):
+            sock.close()
+            raise ConnectionError(f"HTTP CONNECT failed: {status_line}")
         sock.settimeout(timeout)
-        sock.connect((host, port))
         return sock
 
 # =====================================================================
@@ -121,7 +129,7 @@ class AlertManager:
     _MAX_QUEUE_SIZE = 100
 
     # 关闭时等待剩余邮件发送的最大时长（秒）
-    _DRAIN_TIMEOUT = 5
+    _DRAIN_TIMEOUT = 15
 
     def __init__(self, config, logger=None):
         """
@@ -144,18 +152,8 @@ class AlertManager:
         # 关闭标志
         self._shutdown = False
 
-        # 代理配置（用于 SMTP 出站，复用 CAMOUFOX_PROXY）
-        self._proxy_info = None
-        if config.proxy:
-            proxy_info = parse_proxy_url(config.proxy, self.logger)
-            if proxy_info:
-                try:
-                    import socks  # noqa: F401 — 验证 PySocks 可用
-                    self._proxy_info = proxy_info
-                except ImportError:
-                    self.logger.warning(
-                        "SMTP 代理需要 PySocks 库，未安装，SMTP 邮件发送将使用直连"
-                    )
+        # 本地代理中继 URL（用于 SMTP HTTP CONNECT 隧道）
+        self._local_proxy_url = config.local_proxy_url
 
         # 统计计数器（用于日志和健康检查）
         self._sent_count = 0
@@ -202,8 +200,9 @@ class AlertManager:
         """
         停止后台 Worker。
 
-        先标记关闭，然后等待队列中剩余邮件发送完毕（最多 _DRAIN_TIMEOUT 秒），
-        最后取消 Worker 任务。
+        先标记关闭并放入 sentinel 唤醒 Worker，然后等待 Worker 自然完成
+        当前正在发送的邮件和队列中剩余的邮件（最多 _DRAIN_TIMEOUT 秒），
+        超时后取消 Worker 任务。
         """
         if not self._worker_task:
             return
@@ -218,31 +217,31 @@ class AlertManager:
             f"累计丢弃: {self._dropped_count})"
         )
 
-        # 等待队列排空或超时
-        if remaining > 0:
-            try:
-                await asyncio.wait_for(self._drain(), timeout=self._DRAIN_TIMEOUT)
-                self.logger.info("邮件队列已排空")
-            except asyncio.TimeoutError:
-                still_remaining = self._queue.qsize()
-                if still_remaining > 0:
-                    self.logger.warning(
-                        f"邮件队列排空超时，丢弃剩余 {still_remaining} 封邮件"
-                    )
-
-        # 取消 Worker 任务
-        self._worker_task.cancel()
+        # 放入 sentinel 唤醒可能在 get() 中等待的 Worker，避免空队列时多等 5 秒
         try:
-            await self._worker_task
-        except asyncio.CancelledError:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
             pass
 
-        self.logger.info("邮件告警服务已关闭")
+        # 等待 Worker 自然完成：
+        # Worker 检测到 _shutdown 或 sentinel 后会完成当前正在发送的邮件，
+        # 然后在 drain 阶段处理队列中剩余的邮件，最后自然退出。
+        try:
+            await asyncio.wait_for(self._worker_task, timeout=self._DRAIN_TIMEOUT)
+            self.logger.info("邮件队列已排空")
+        except asyncio.TimeoutError:
+            still_remaining = self._queue.qsize()
+            if still_remaining > 0:
+                self.logger.warning(
+                    f"邮件队列排空超时，丢弃剩余 {still_remaining} 封邮件"
+                )
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
 
-    async def _drain(self):
-        """等待队列为空"""
-        while not self._queue.empty():
-            await asyncio.sleep(0.2)
+        self.logger.info("邮件告警服务已关闭")
 
     # =================================================================
     # 告警发射接口
@@ -324,6 +323,7 @@ class AlertManager:
 
         从队列中逐个取出事件，在后台线程中执行 SMTP 发送。
         持续运行直到 _shutdown 标志被设置，然后排空剩余队列。
+        队列中的 None 值为关闭 sentinel，用于立即唤醒 Worker。
         """
         self.logger.debug("邮件发送 Worker 已启动")
 
@@ -339,6 +339,9 @@ class AlertManager:
             except asyncio.CancelledError:
                 break
 
+            if event is None:
+                break  # 关闭 sentinel
+
             await self._send_one(event)
 
         # ── 关闭阶段：排空队列中剩余的事件 ──
@@ -346,6 +349,8 @@ class AlertManager:
         while not self._queue.empty():
             try:
                 event = self._queue.get_nowait()
+                if event is None:
+                    continue  # 跳过 sentinel
                 await self._send_one(event)
                 drained += 1
             except asyncio.QueueEmpty:
@@ -411,7 +416,7 @@ class AlertManager:
             )
 
         except OSError as e:
-            # PySocks 代理连接错误等其他网络层异常（非 ConnectionError / TimeoutError 子类）
+            # 代理连接错误等其他网络层异常（非 ConnectionError / TimeoutError 子类）
             self.logger.error(
                 f"SMTP 网络错误（可能是代理连接问题）: {type(e).__name__}: {e}"
             )
@@ -458,10 +463,12 @@ class AlertManager:
         # ── SMTP STARTTLS 发送 ──
         ctx = ssl.create_default_context()
         # 根据代理配置选择 SMTP 连接方式
-        if self._proxy_info:
-            server = _ProxiedSMTP(
+        if self._local_proxy_url:
+            from urllib.parse import urlparse as _urlparse
+            _parsed = _urlparse(self._local_proxy_url)
+            server = _HttpConnectSMTP(
                 self.config.smtp_host, self.config.smtp_port,
-                self._proxy_info, timeout=30
+                _parsed.hostname, _parsed.port, timeout=30
             )
         else:
             server = smtplib.SMTP(

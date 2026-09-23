@@ -795,6 +795,7 @@ class RuntimeConfig:
     target_url: str = ""
     headless_mode: Any = 'virtual'       # True / False / 'virtual'
     proxy: Optional[str] = None
+    local_proxy_url: Optional[str] = None    # proxy_relay 本地代理 URL
     instance_start_delay: int = 30       # BrowserContext 启动错峰间隔（秒）
     max_instance_retries: int = 5        # 单账号 Context 级最大重试
     max_browser_retries: int = 5         # 共享浏览器级最大重启
